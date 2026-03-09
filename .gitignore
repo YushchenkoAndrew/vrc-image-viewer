@@ -10,6 +10,10 @@
 !.yarn/releases
 !.yarn/versions
 
+*.png
+
+vr-sync
+
 # testing
 /coverage
 
