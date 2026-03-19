@@ -7,6 +7,7 @@ import (
 	"grape/src/common/middleware"
 	m "grape/src/common/module"
 	"grape/src/common/service"
+	"grape/src/swagger"
 	"net/http"
 	"path/filepath"
 
@@ -35,7 +36,9 @@ func main() {
 
 	r := gin.Default()
 	rg := r.Group(cfg.Server.Prefix, middleware.GetMiddleware(service).Default())
-	module := src.NewIndexModule(rg, []m.ModuleT{}, service)
+	module := src.NewIndexModule(rg, []m.ModuleT{
+		swagger.NewSwaggerRouter(rg),
+	}, service)
 
 	module.Init()
 

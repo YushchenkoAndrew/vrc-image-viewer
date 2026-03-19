@@ -10,6 +10,8 @@
 !.yarn/releases
 !.yarn/versions
 
+.gopath/
+
 *.png
 
 vr-sync

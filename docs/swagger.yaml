@@ -1,0 +1,39 @@
+basePath: /grape
+info:
+  contact:
+    email: AndrewYushchenko@gmail.com
+    name: API Author
+  description: Gin API for my various projects
+  title: Gin API
+  version: "3.0"
+paths:
+  /copy:
+    post:
+      consumes:
+      - application/json
+      produces:
+      - application/json
+      - application/xml
+      responses:
+        "200":
+          description: OK
+          schema: {}
+      summary: Copy
+  /image:
+    get:
+      consumes:
+      - application/json
+      produces:
+      - application/json
+      - application/xml
+      responses:
+        "200":
+          description: OK
+          schema: {}
+      summary: Image
+securityDefinitions:
+  BearerAuth:
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"
