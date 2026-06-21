@@ -1,6 +1,7 @@
 package src
 
 import (
+	"fmt"
 	"grape/src/common/config"
 	"grape/src/common/service"
 	"maps"
@@ -53,10 +54,17 @@ func (c *IndexService) sync() *IndexService {
 }
 
 func (c *IndexService) Copy(query string) error {
-	println("query=" + query)
-	cmd := exec.Command("wl-copy")
-	cmd.Stdin = strings.NewReader(query)
-	return cmd.Run()
+	cmds := []*exec.Cmd{exec.Command("xsel", "-ib"), exec.Command("wl-copy")}
+
+	for _, cmd := range cmds {
+		cmd.Stdin = strings.NewReader(query)
+		if err := cmd.Run(); err != nil {
+			fmt.Printf("%v\n", err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *IndexService) Image() interface{} {
