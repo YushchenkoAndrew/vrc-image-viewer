@@ -1,6 +1,7 @@
 package src
 
 import (
+	"grape/src/common/dto/request"
 	"grape/src/common/dto/response"
 	"net/http"
 
@@ -9,7 +10,8 @@ import (
 
 type IndexT interface {
 	Copy(c *gin.Context)
-	Image(c *gin.Context)
+	FindAll(c *gin.Context)
+	Delete(c *gin.Context)
 }
 
 type indexController struct {
@@ -34,13 +36,32 @@ func (c *indexController) Copy(ctx *gin.Context) {
 	response.Handler(ctx, http.StatusNoContent, gin.H{}, err)
 }
 
-// @Summary Image
+// @Summary FindAll
 // @Accept json
 // @Produce application/json
 // @Produce application/xml
 // @Success 200 {object} interface{}
-// @Router /image [get]
-func (c *indexController) Image(ctx *gin.Context) {
-	res := c.service.Image()
+// @Router /images [get]
+func (c *indexController) FindAll(ctx *gin.Context) {
+	dto := request.NewPageDto()
+
+	if err := ctx.ShouldBindQuery(&dto); err != nil {
+		response.BadRequest(ctx, err)
+		return
+	}
+
+	res := c.service.FindAll(dto)
+	response.Handler(ctx, http.StatusOK, res, nil)
+}
+
+// @Summary Delete
+// @Accept json
+// @Produce application/json
+// @Produce application/xml
+// @Param id path string true "Image mda5 id"
+// @Success 200 {object} interface{}
+// @Router /images/:id [delete]
+func (c *indexController) Delete(ctx *gin.Context) {
+	res := c.service.Delete(ctx.Param("id"))
 	response.Handler(ctx, http.StatusOK, res, nil)
 }

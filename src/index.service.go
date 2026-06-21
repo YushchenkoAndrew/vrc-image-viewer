@@ -3,6 +3,8 @@ package src
 import (
 	"fmt"
 	"grape/src/common/config"
+	"grape/src/common/dto/request"
+	"grape/src/common/helper"
 	"grape/src/common/service"
 	"maps"
 	"os"
@@ -16,17 +18,31 @@ import (
 
 type IndexService struct {
 	config *config.Config
-	links  map[string]bool
+	links  map[string]string
 }
 
 func NewIndexService(s *service.CommonService) *IndexService {
-	return (&IndexService{config: s.Config, links: make(map[string]bool)}).fill().sync()
+	return (&IndexService{config: s.Config, links: make(map[string]string)}).fill().sync()
+}
+
+func (c *IndexService) compress(file string) string {
+	src := filepath.Join(c.config.Vrchat.Dst, filepath.Base(file))
+	dst := filepath.Join(c.config.Vrchat.Dst, "thumbnails", filepath.Base(file))
+
+	helper.Thumbnail(src, dst, 30)
+
+	return file
 }
 
 func (c *IndexService) fill() *IndexService {
 	entries, _ := os.ReadDir(c.config.Vrchat.Dst)
 	for _, f := range entries {
-		c.links[filepath.Join(filepath.Base(c.config.Vrchat.Dst), f.Name())] = true
+		if f.IsDir() {
+			continue
+		}
+
+		file := filepath.Join(filepath.Base(c.config.Vrchat.Dst), f.Name())
+		c.links[helper.Btoa(file)] = c.compress(file)
 	}
 
 	return c
@@ -44,7 +60,7 @@ func (c *IndexService) sync() *IndexService {
 
 				if _, ok := c.links[file]; !ok {
 					exec.Command("mv", filepath.Join(c.config.Vrchat.Src, d.Name(), f.Name()), filepath.Join(c.config.Vrchat.Dst, f.Name())).Run()
-					c.links[file] = true
+					c.links[helper.Btoa(file)] = c.compress(file)
 				}
 			}
 		}
@@ -67,9 +83,20 @@ func (c *IndexService) Copy(query string) error {
 	return nil
 }
 
-func (c *IndexService) Image() interface{} {
-	keys := slices.Collect(maps.Keys(c.sync().links))
+func (c *IndexService) FindAll(dto *request.PageDto) interface{} {
+	keys := slices.Collect(maps.Values(c.sync().links))
 	slices.Sort(keys)
 	slices.Reverse(keys)
-	return gin.H{"files": keys}
+	return gin.H{"files": dto.Paginate(keys)}
+}
+
+func (c *IndexService) Delete(id string) interface{} {
+	if file, ok := c.links[id]; ok {
+		delete(c.links, id)
+
+		os.Remove(filepath.Join(c.config.Vrchat.Dst, filepath.Base(file)))
+		os.Remove(filepath.Join(c.config.Vrchat.Dst, "thumbnails", filepath.Base(file)))
+	}
+
+	return gin.H{}
 }

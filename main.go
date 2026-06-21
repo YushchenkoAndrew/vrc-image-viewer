@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path/filepath"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-contrib/static"
 	"github.com/gin-gonic/gin"
 )
@@ -35,6 +36,7 @@ func main() {
 	}
 
 	r := gin.Default()
+	r.Use(cors.Default())
 	rg := r.Group(cfg.Server.Prefix, middleware.GetMiddleware(service).Default())
 	module := src.NewIndexModule(rg, []m.ModuleT{
 		swagger.NewSwaggerRouter(rg),

@@ -23,8 +23,9 @@ func NewIndexModule(route *gin.RouterGroup, modules []m.ModuleT, s *service.Comm
 
 func (c *indexModule) Init() {
 	// c.Route.GET("/", c.Controller.Index)
-	c.Route.GET("/images", c.Controller.Image)
 	c.Route.POST("/copy", c.Controller.Copy)
+	c.Route.GET("/images", c.Controller.FindAll)
+	c.Route.DELETE("/images/:id", c.Controller.Delete)
 
 	c.Module.Init()
 }

@@ -3,7 +3,7 @@
 dev: 
 	go run main.go
 
-build: swagger
+build: 
 	go build -o ./vr-sync main.go
 
 test:
