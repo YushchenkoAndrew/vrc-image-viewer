@@ -18,7 +18,6 @@
     contrast: number;
     saturation: number;
     hue: number; // 0–360
-    vignette: number; // 0–100
     crop: { x: number; y: number; w: number; h: number } | null;
   }
   const DEFAULT_EDIT: EditState = {
@@ -29,36 +28,65 @@
     contrast: 100,
     saturation: 100,
     hue: 0,
-    vignette: 0,
     crop: null,
   };
 
-  // ── localStorage persistence ───────────────────────────────────────────────
+  // ── Persistence: localStorage + remote ────────────────────────────────────
   const LS_KEY = 'vrsync-edits-v2';
-  function loadEdits(): Record<string, EditState> {
+
+  function loadAllLocal(): Record<string, EditState> {
     try {
       return JSON.parse(localStorage.getItem(LS_KEY) ?? '{}');
     } catch {
       return {};
     }
   }
-  function saveEdits(edits: Record<string, EditState>) {
+  function saveAllLocal(edits: Record<string, EditState>) {
     localStorage.setItem(LS_KEY, JSON.stringify(edits));
   }
+
+  // POST images/:id/settings  — fire-and-forget, errors are silent
+  function saveRemote(id: string, e: EditState) {
+    fetch(`/images/${id}/settings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ settings: JSON.stringify(e) }),
+    }).catch(() => {});
+  }
+
+  // GET images/:id/settings → returns { settings: "<json string>" }
+  // Returns null on any error so caller falls back to localStorage
+  async function loadRemote(id: string): Promise<EditState | null> {
+    try {
+      const res = await fetch(`/images/${id}/settings`);
+      if (!res.ok) return null;
+      const json = await res.json();
+      return JSON.parse(json.settings) as EditState;
+    } catch {
+      return null;
+    }
+  }
+
   let allEdits = $state<Record<string, EditState>>({});
+
   function getEdit(src: string): EditState {
     return allEdits[src] ?? { ...DEFAULT_EDIT };
   }
-  function setEdit(src: string, e: EditState) {
+
+  function setEdit(src: string, id: string, e: EditState) {
     allEdits = { ...allEdits, [src]: e };
-    saveEdits(allEdits);
+    saveAllLocal(allEdits);
+    saveRemote(id, e);
   }
-  function clearEdit(src: string) {
+
+  function clearEdit(src: string, id: string) {
     const copy = { ...allEdits };
     delete copy[src];
     allEdits = copy;
-    saveEdits(allEdits);
+    saveAllLocal(allEdits);
+    saveRemote(id, { ...DEFAULT_EDIT });
   }
+
   function isEdited(e: EditState): boolean {
     return JSON.stringify(e) !== JSON.stringify(DEFAULT_EDIT);
   }
@@ -89,15 +117,36 @@
     null,
   );
 
-  // Auto-save edits whenever `edit` changes while editor is open
+  // Tracks the edit state as it was when the editor was opened (after remote load).
+  // We only POST if the current edit differs from this baseline.
+  let editBaseline = $state<EditState | null>(null);
+
+  // Auto-save edits whenever `edit` changes while editor is open.
+  // We must read every tracked field BEFORE any early return so Svelte
+  // registers them as dependencies regardless of the guard condition.
   let autoSaveTimer: ReturnType<typeof setTimeout>;
   $effect(() => {
-    // Access edit fields so the effect tracks them
-    const snapshot = { ...edit };
-    if (!editorOpen || !editorImage) return;
+    // Destructure all fields so Svelte 5 tracks each one as a dependency
+    const snapshot: EditState = {
+      rotation: edit.rotation,
+      flipH: edit.flipH,
+      flipV: edit.flipV,
+      brightness: edit.brightness,
+      contrast: edit.contrast,
+      saturation: edit.saturation,
+      hue: edit.hue,
+      crop: edit.crop ? { ...edit.crop } : null,
+    };
+    const img = editorImage;
+    const open = editorOpen;
+    const base = editBaseline;
+    // Guard AFTER reading all reactive values
+    if (!open || !img || !base) return;
+    // Only save if something actually changed from the loaded baseline
+    if (JSON.stringify(snapshot) === JSON.stringify(base)) return;
     clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(() => {
-      setEdit(editorImage!.src, snapshot);
+      setEdit(img.src, img.id, snapshot);
     }, 600);
   });
 
@@ -149,6 +198,154 @@
     return parts.join(' ');
   }
 
+  // ── Download with canvas ───────────────────────────────────────────────────
+  // Crop coords (x,y,w,h in %) are expressed in the DISPLAYED coordinate space
+  // (after CSS rotation/flip). We must transform them back to natural image space.
+  async function download(
+    img: ImageFile,
+    e: MouseEvent,
+    liveEdit: EditState | undefined = undefined,
+  ) {
+    e.stopPropagation();
+    const ed = liveEdit ?? getEdit(img.src);
+    if (!isEdited(ed)) {
+      try {
+        const blob = await fetch(img.src).then((r) => r.blob());
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = img.name;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch {
+        window.open(img.src, '_blank');
+      }
+      return;
+    }
+
+    const image = new Image();
+    image.crossOrigin = 'anonymous';
+    image.src = img.src;
+    await new Promise((res, rej) => {
+      image.onload = res;
+      image.onerror = rej;
+    });
+
+    const NW = image.naturalWidth,
+      NH = image.naturalHeight;
+    const rot = ed.rotation;
+
+    // Step 1: figure out the natural-space crop rectangle.
+    // Crop percentages are in DISPLAYED space (after rotation).
+    // Displayed dimensions after rotation:
+    const swapped = rot === 90 || rot === 270;
+    // dispW/dispH = size of the image as the user sees it
+    // (for percentage math, actual px doesn't matter — just which axis is which)
+    let cx_n: number, cy_n: number, cw_n: number, ch_n: number;
+
+    if (ed.crop) {
+      const { x: px, y: py, w: pw, h: ph } = ed.crop; // 0-100 in display space
+
+      // Convert display % → natural % by inverting the rotation transform.
+      // The CSS rotation rotates the image around its center.
+      // We need to map display (px,py) → natural (nx,ny).
+      //
+      // For each rotation angle, the displayed top-left in natural coords:
+      //   rot=0:   natural (px, py)
+      //   rot=90:  natural (py, 100-px-pw) for origin, natural axes swap
+      //   rot=180: natural (100-px-pw, 100-py-ph)
+      //   rot=270: natural (100-py-ph, px)
+      //
+      // Accounting for flipH/flipV is applied AFTER rotation in CSS,
+      // so we also invert those.
+
+      let [dx, dy, dw, dh] = [px, py, pw, ph];
+
+      // Invert flipH (applied in display space after rotation)
+      if (ed.flipH) {
+        dx = 100 - dx - dw;
+      }
+      // Invert flipV
+      if (ed.flipV) {
+        dy = 100 - dy - dh;
+      }
+
+      // Invert rotation to get natural-space rectangle
+      if (rot === 0) {
+        cx_n = dx;
+        cy_n = dy;
+        cw_n = dw;
+        ch_n = dh;
+      } else if (rot === 90) {
+        // display x → natural y (from bottom), display y → natural x
+        cx_n = dy;
+        cy_n = 100 - dx - dw;
+        cw_n = dh;
+        ch_n = dw;
+      } else if (rot === 180) {
+        cx_n = 100 - dx - dw;
+        cy_n = 100 - dy - dh;
+        cw_n = dw;
+        ch_n = dh;
+      } else {
+        // 270
+        cx_n = 100 - dy - dh;
+        cy_n = dx;
+        cw_n = dh;
+        ch_n = dw;
+      }
+
+      // Convert % to pixels in natural space
+      cx_n = (cx_n / 100) * NW;
+      cy_n = (cy_n / 100) * NH;
+      cw_n = (cw_n / 100) * NW;
+      ch_n = (ch_n / 100) * NH;
+    } else {
+      cx_n = 0;
+      cy_n = 0;
+      cw_n = NW;
+      ch_n = NH;
+    }
+
+    // Step 2: output canvas size = crop region after rotation
+    const outW = swapped ? ch_n : cw_n;
+    const outH = swapped ? cw_n : ch_n;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(outW);
+    canvas.height = Math.round(outH);
+    const ctx = canvas.getContext('2d')!;
+    ctx.filter = editToFilter(ed);
+    ctx.save();
+    ctx.translate(outW / 2, outH / 2);
+    ctx.rotate((rot * Math.PI) / 180);
+    if (ed.flipH) ctx.scale(-1, 1);
+    if (ed.flipV) ctx.scale(1, -1);
+    // Draw the natural crop region, centered
+    ctx.drawImage(
+      image,
+      cx_n,
+      cy_n,
+      cw_n,
+      ch_n,
+      -cw_n / 2,
+      -ch_n / 2,
+      cw_n,
+      ch_n,
+    );
+    ctx.restore();
+
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = img.name.replace(/(\.\w+)$/, '_edited$1');
+      a.click();
+      URL.revokeObjectURL(url);
+    }, 'image/png');
+  }
+
   // ── Data fetching ──────────────────────────────────────────────────────────
   async function loadMore() {
     if (loadingMore || !hasMore) return;
@@ -175,7 +372,7 @@
   }
 
   onMount(async () => {
-    allEdits = loadEdits();
+    allEdits = loadAllLocal();
     await loadMore();
     const obs = new IntersectionObserver(
       (e) => {
@@ -227,18 +424,34 @@
   }
 
   // ── Editor open/close ──────────────────────────────────────────────────────
-  function openEditor(img: ImageFile) {
+  async function openEditor(img: ImageFile) {
     editorImage = img;
     edit = { ...getEdit(img.src) };
+    editBaseline = null; // clear while loading so effect doesn't fire
     cropMode = false;
     cropDraft = null;
     cropStart = null;
     editorOpen = true;
     document.body.style.overflow = 'hidden';
+
+    // Fetch remote settings — on success overwrite local
+    const remote = await loadRemote(img.id);
+    if (remote) {
+      allEdits = { ...allEdits, [img.src]: remote };
+      saveAllLocal(allEdits);
+      if (editorImage?.src === img.src) {
+        edit = { ...remote };
+      }
+    } else await saveRemote(img.id, allEdits[img.src] || {});
+    // Set baseline AFTER load — effect will only POST if edit diverges from this
+    if (editorImage?.src === img.src) {
+      editBaseline = { ...edit };
+    }
   }
   function closeEditor() {
     editorOpen = false;
     editorImage = null;
+    editBaseline = null;
     cropMode = false;
     cropDraft = null;
     document.body.style.overflow = '';
@@ -256,143 +469,235 @@
   }
 
   // ── Crop ───────────────────────────────────────────────────────────────────
+  let imgEl: HTMLImageElement;
+  let imgRect = $state<{
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  } | null>(null);
+
+  function updateImgRect() {
+    if (imgEl) {
+      const r = imgEl.getBoundingClientRect();
+      imgRect = { left: r.left, top: r.top, width: r.width, height: r.height };
+    }
+  }
+
   function enterCropMode() {
     cropMode = true;
     cropDraft = null;
     cropStart = null;
+    requestAnimationFrame(() => requestAnimationFrame(updateImgRect));
   }
   function cancelCrop() {
     cropMode = false;
     cropDraft = null;
     cropStart = null;
+    cropAction = 'none';
   }
   function applyCrop() {
     if (cropDraft && cropDraft.w > 0.5 && cropDraft.h > 0.5)
       edit = { ...edit, crop: { ...cropDraft } };
     cropMode = false;
     cropDraft = null;
+    cropAction = 'none';
   }
   function resetCrop() {
     edit = { ...edit, crop: null };
   }
 
-  function pct(el: HTMLElement, cx: number, cy: number) {
-    const r = el.getBoundingClientRect();
+  function imgPct(cx: number, cy: number) {
+    const r = imgRect!;
     return {
       x: Math.max(0, Math.min(100, ((cx - r.left) / r.width) * 100)),
       y: Math.max(0, Math.min(100, ((cy - r.top) / r.height) * 100)),
     };
   }
-  function onCropDown(e: PointerEvent) {
-    e.preventDefault();
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    const p = pct(e.currentTarget as HTMLElement, e.clientX, e.clientY);
-    cropStart = p;
-    cropDraft = { x: p.x, y: p.y, w: 0, h: 0 };
-  }
-  function onCropMove(e: PointerEvent) {
-    if (!cropStart) return;
-    const p = pct(e.currentTarget as HTMLElement, e.clientX, e.clientY);
-    cropDraft = {
-      x: Math.min(cropStart.x, p.x),
-      y: Math.min(cropStart.y, p.y),
-      w: Math.abs(p.x - cropStart.x),
-      h: Math.abs(p.y - cropStart.y),
-    };
-  }
-  function onCropUp() {
-    cropStart = null;
+
+  // ── Crop interaction state machine ─────────────────────────────────────────
+  type CropAction =
+    | 'none'
+    | 'draw'
+    | 'move'
+    | 'resize-tl'
+    | 'resize-t'
+    | 'resize-tr'
+    | 'resize-r'
+    | 'resize-br'
+    | 'resize-b'
+    | 'resize-bl'
+    | 'resize-l';
+
+  let cropAction = $state<CropAction>('none');
+  // Snapshot of cropDraft at pointer-down, plus pointer-down position
+  let cropActionStart = $state<{
+    px: number;
+    py: number;
+    rx: number;
+    ry: number;
+    rw: number;
+    rh: number;
+  } | null>(null);
+
+  // Which cursor to show based on hover handle
+  let cropCursor = $state('crosshair');
+
+  const HANDLE_HIT = 8; // % of rect dimension — hit zone for handles
+
+  function hitTest(
+    p: { x: number; y: number },
+    d: typeof cropDraft,
+  ): CropAction {
+    if (!d || d.w < 0.5 || d.h < 0.5) return 'draw';
+    const { x, y, w, h } = d;
+    const ex = x + w,
+      ey = y + h;
+    // hit threshold in percentage points (fixed 1.5% of image, min 6px feel)
+    const HX = Math.min(HANDLE_HIT, w * 0.35);
+    const HY = Math.min(HANDLE_HIT, h * 0.35);
+
+    const inX = p.x >= x && p.x <= ex;
+    const inY = p.y >= y && p.y <= ey;
+    const onL = inY && p.x >= x - HX && p.x <= x + HX;
+    const onR = inY && p.x >= ex - HX && p.x <= ex + HX;
+    const onT = inX && p.y >= y - HY && p.y <= y + HY;
+    const onB = inX && p.y >= ey - HY && p.y <= ey + HY;
+
+    if (onL && onT) return 'resize-tl';
+    if (onR && onT) return 'resize-tr';
+    if (onR && onB) return 'resize-br';
+    if (onL && onB) return 'resize-bl';
+    if (onT) return 'resize-t';
+    if (onB) return 'resize-b';
+    if (onL) return 'resize-l';
+    if (onR) return 'resize-r';
+    if (inX && inY) return 'move';
+    return 'draw';
   }
 
-  // ── Download with canvas ───────────────────────────────────────────────────
-  async function download(
-    img: ImageFile,
-    e: MouseEvent,
-    liveEdit: EditState | undefined = undefined,
-  ) {
-    e.stopPropagation();
-    const ed = liveEdit ?? getEdit(img.src);
-    if (!isEdited(ed)) {
-      try {
-        const blob = await fetch(img.src).then((r) => r.blob());
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = img.name;
-        a.click();
-        URL.revokeObjectURL(url);
-      } catch {
-        window.open(img.src, '_blank');
-      }
+  const ACTION_CURSOR: Record<CropAction, string> = {
+    none: 'crosshair',
+    draw: 'crosshair',
+    move: 'move',
+    'resize-tl': 'nwse-resize',
+    'resize-br': 'nwse-resize',
+    'resize-tr': 'nesw-resize',
+    'resize-bl': 'nesw-resize',
+    'resize-t': 'ns-resize',
+    'resize-b': 'ns-resize',
+    'resize-l': 'ew-resize',
+    'resize-r': 'ew-resize',
+  };
+
+  function onCropMouseMove(e: PointerEvent) {
+    if (cropAction !== 'none') {
+      onCropDrag(e);
       return;
     }
-    const image = new Image();
-    image.crossOrigin = 'anonymous';
-    image.src = img.src;
-    await new Promise((res, rej) => {
-      image.onload = res;
-      image.onerror = rej;
-    });
-    const rot = ed.rotation,
-      swapped = rot === 90 || rot === 270;
-    const srcW = image.naturalWidth,
-      srcH = image.naturalHeight;
-    let cx = 0,
-      cy = 0,
-      cw = srcW,
-      ch = srcH;
-    if (ed.crop) {
-      cx = (ed.crop.x / 100) * srcW;
-      cy = (ed.crop.y / 100) * srcH;
-      cw = (ed.crop.w / 100) * srcW;
-      ch = (ed.crop.h / 100) * srcH;
+    if (!cropDraft) {
+      cropCursor = 'crosshair';
+      return;
     }
-    const outW = swapped ? ch : cw,
-      outH = swapped ? cw : ch;
-    const canvas = document.createElement('canvas');
-    canvas.width = outW;
-    canvas.height = outH;
-    const ctx = canvas.getContext('2d')!;
-    ctx.filter = editToFilter(ed);
-    ctx.save();
-    ctx.translate(outW / 2, outH / 2);
-    ctx.rotate((rot * Math.PI) / 180);
-    if (ed.flipH) ctx.scale(-1, 1);
-    if (ed.flipV) ctx.scale(1, -1);
-    ctx.drawImage(image, cx, cy, cw, ch, -cw / 2, -ch / 2, cw, ch);
-    ctx.restore();
-    if (ed.vignette > 0) {
-      ctx.filter = 'none';
-      const g = ctx.createRadialGradient(
-        outW / 2,
-        outH / 2,
-        outW * 0.2,
-        outW / 2,
-        outH / 2,
-        outW * 0.8,
-      );
-      g.addColorStop(0, 'rgba(0,0,0,0)');
-      g.addColorStop(1, `rgba(0,0,0,${ed.vignette / 100})`);
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, outW, outH);
-    }
-    canvas.toBlob((blob) => {
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = img.name.replace(/(\.\w+)$/, '_edited$1');
-      a.click();
-      URL.revokeObjectURL(url);
-    }, 'image/png');
+    const p = imgPct(e.clientX, e.clientY);
+    const action = hitTest(p, cropDraft);
+    cropCursor = ACTION_CURSOR[action];
   }
+
+  function onCropDown(e: PointerEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const p = imgPct(e.clientX, e.clientY);
+    const action = cropDraft ? hitTest(p, cropDraft) : 'draw';
+    cropAction = action;
+    if (action === 'draw') {
+      cropStart = p;
+      cropDraft = { x: p.x, y: p.y, w: 0, h: 0 };
+      cropActionStart = null;
+    } else {
+      cropActionStart = {
+        px: p.x,
+        py: p.y,
+        rx: cropDraft!.x,
+        ry: cropDraft!.y,
+        rw: cropDraft!.w,
+        rh: cropDraft!.h,
+      };
+    }
+  }
+
+  function onCropDrag(e: PointerEvent) {
+    const p = imgPct(e.clientX, e.clientY);
+
+    if (cropAction === 'draw' && cropStart) {
+      cropDraft = {
+        x: Math.min(cropStart.x, p.x),
+        y: Math.min(cropStart.y, p.y),
+        w: Math.abs(p.x - cropStart.x),
+        h: Math.abs(p.y - cropStart.y),
+      };
+      return;
+    }
+
+    if (!cropActionStart || !cropDraft) return;
+    const { px, py, rx, ry, rw, rh } = cropActionStart;
+    const dx = p.x - px,
+      dy = p.y - py;
+
+    const clamp = (v: number, lo: number, hi: number) =>
+      Math.max(lo, Math.min(hi, v));
+
+    if (cropAction === 'move') {
+      cropDraft = {
+        x: clamp(rx + dx, 0, 100 - rw),
+        y: clamp(ry + dy, 0, 100 - rh),
+        w: rw,
+        h: rh,
+      };
+      return;
+    }
+
+    let { x, y, w, h } = { x: rx, y: ry, w: rw, h: rh };
+    const MIN = 2; // minimum crop size %
+
+    if (cropAction.includes('l')) {
+      const nx = clamp(rx + dx, 0, rx + rw - MIN);
+      x = nx;
+      w = rx + rw - nx;
+    }
+    if (cropAction.includes('r')) {
+      w = clamp(rw + dx, MIN, 100 - rx);
+    }
+    if (cropAction.includes('t')) {
+      const ny = clamp(ry + dy, 0, ry + rh - MIN);
+      y = ny;
+      h = ry + rh - ny;
+    }
+    if (cropAction.includes('b')) {
+      h = clamp(rh + dy, MIN, 100 - ry);
+    }
+    cropDraft = { x, y, w, h };
+  }
+
+  function onCropUp(e: PointerEvent) {
+    e.stopPropagation();
+    cropAction = 'none';
+    cropStart = null;
+    cropActionStart = null;
+  }
+
+  $effect(() => {
+    void edit.rotation;
+    if (cropMode) requestAnimationFrame(updateImgRect);
+  });
 
   // ── Delete ─────────────────────────────────────────────────────────────────
   async function confirmDelete() {
     if (!deleteTarget) return;
     deleting = true;
     try {
-      const res = await fetch(`/delete/${deleteTarget.id}`, {
+      const res = await fetch(`/images/${deleteTarget.id}`, {
         method: 'DELETE',
       });
       if (res.ok) {
@@ -428,6 +733,107 @@
   let editorFilter = $derived(editorImage ? editToFilter(edit) : 'none');
   let editorTransform = $derived(editorImage ? editToTransform(edit) : 'none');
   let editorHasEdits = $derived(isEdited(edit));
+
+  // ── Canvas crop preview ────────────────────────────────────────────────────
+  // When a crop is active (and not in crop-draw mode), we render the result
+  // onto a canvas so the display matches the download exactly.
+  let previewCanvas: HTMLCanvasElement;
+  let previewUrl = $state<string | null>(null);
+
+  async function renderCropPreview(img: ImageFile, ed: EditState) {
+    if (!ed.crop) {
+      previewUrl = null;
+      return;
+    }
+    const image = new Image();
+    image.crossOrigin = 'anonymous';
+    image.src = img.src;
+    await new Promise((res, rej) => {
+      image.onload = res;
+      image.onerror = rej;
+    });
+
+    const NW = image.naturalWidth,
+      NH = image.naturalHeight;
+    const rot = ed.rotation;
+    const swapped = rot === 90 || rot === 270;
+    let cx_n: number, cy_n: number, cw_n: number, ch_n: number;
+
+    const { x: px, y: py, w: pw, h: ph } = ed.crop;
+    let [dx, dy, dw, dh] = [px, py, pw, ph];
+    if (ed.flipH) {
+      dx = 100 - dx - dw;
+    }
+    if (ed.flipV) {
+      dy = 100 - dy - dh;
+    }
+
+    if (rot === 0) {
+      cx_n = dx;
+      cy_n = dy;
+      cw_n = dw;
+      ch_n = dh;
+    } else if (rot === 90) {
+      cx_n = dy;
+      cy_n = 100 - dx - dw;
+      cw_n = dh;
+      ch_n = dw;
+    } else if (rot === 180) {
+      cx_n = 100 - dx - dw;
+      cy_n = 100 - dy - dh;
+      cw_n = dw;
+      ch_n = dh;
+    } else {
+      cx_n = 100 - dy - dh;
+      cy_n = dx;
+      cw_n = dh;
+      ch_n = dw;
+    }
+
+    cx_n = (cx_n / 100) * NW;
+    cy_n = (cy_n / 100) * NH;
+    cw_n = (cw_n / 100) * NW;
+    ch_n = (ch_n / 100) * NH;
+
+    const outW = Math.round(swapped ? ch_n : cw_n);
+    const outH = Math.round(swapped ? cw_n : ch_n);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext('2d')!;
+    ctx.filter = editToFilter(ed);
+    ctx.save();
+    ctx.translate(outW / 2, outH / 2);
+    ctx.rotate((rot * Math.PI) / 180);
+    if (ed.flipH) ctx.scale(-1, 1);
+    if (ed.flipV) ctx.scale(1, -1);
+    ctx.drawImage(
+      image,
+      cx_n,
+      cy_n,
+      cw_n,
+      ch_n,
+      -cw_n / 2,
+      -ch_n / 2,
+      cw_n,
+      ch_n,
+    );
+    ctx.restore();
+
+    previewUrl = canvas.toDataURL('image/jpeg', 0.92);
+  }
+
+  // Re-render preview whenever edit changes and crop is set
+  $effect(() => {
+    const snap = { ...edit };
+    const img = editorImage;
+    if (!img || !snap.crop || cropMode) {
+      previewUrl = null;
+      return;
+    }
+    renderCropPreview(img, snap);
+  });
 </script>
 
 <svelte:window onkeydown={onKeydown} />
@@ -713,11 +1119,14 @@
 
 <!-- ═══════════════════════════════ EDITOR ════════════════════════════════════ -->
 {#if editorOpen && editorImage}
-  <div class="editor-backdrop">
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+  <div class="editor-backdrop" onclick={closeEditor}>
     <!-- ── Canvas area (center, always fills remaining space) ── -->
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
     <div class="editor-canvas" class:crop-mode={cropMode}>
       <!-- Editor topbar -->
-      <div class="editor-topbar">
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+      <div class="editor-topbar" onclick={(e) => e.stopPropagation()}>
         <button class="ed-top-btn" onclick={closeEditor} title="Close (Esc)">
           <svg
             width="14"
@@ -810,54 +1219,117 @@
       <!-- Image stage -->
       <div class="canvas-stage">
         <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
-        <div
-          class="crop-zone"
-          onpointerdown={cropMode ? onCropDown : undefined}
-          onpointermove={cropMode ? onCropMove : undefined}
-          onpointerup={cropMode ? onCropUp : undefined}
-        >
-          <img
-            src={editorImage.src}
-            alt={editorImage.name}
-            class="editor-img"
-            style="filter:{editorFilter};transform:{editorTransform};"
-          />
-          {#if edit.vignette > 0}
-            <div
-              class="vignette-overlay"
-              style="--va:{edit.vignette / 100}"
-            ></div>
+        <div class="crop-zone" onclick={(e) => e.stopPropagation()}>
+          {#if previewUrl && !cropMode}
+            <!-- Canvas-rendered crop preview: exact same output as download -->
+            <img
+              src={previewUrl}
+              alt="Crop preview"
+              class="editor-img preview-img"
+            />
+          {:else}
+            <!-- Live image with CSS rotation/flip/filter -->
+            <img
+              bind:this={imgEl}
+              src={editorImage.src}
+              alt={editorImage.name}
+              class="editor-img"
+              class:rotated={edit.rotation === 90 || edit.rotation === 270}
+              style="filter:{editorFilter};transform:{editorTransform};"
+            />
           {/if}
-          {#if edit.crop && !cropMode}
+
+          <!-- Crop overlay: fixed-positioned over imgEl's visual bounding rect -->
+          {#if cropMode && imgRect}
+            <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
             <div
-              class="crop-mask"
-              style="--cx:{edit.crop.x}%;--cy:{edit.crop.y}%;--cw:{edit.crop
-                .w}%;--ch:{edit.crop.h}%"
-            ></div>
-          {/if}
-          {#if cropDraft && cropDraft.w > 0.5 && cropDraft.h > 0.5}
-            <div
-              class="crop-rect"
-              style="left:{cropDraft.x}%;top:{cropDraft.y}%;width:{cropDraft.w}%;height:{cropDraft.h}%"
+              class="crop-overlay"
+              style="position:fixed;left:{imgRect.left}px;top:{imgRect.top}px;width:{imgRect.width}px;height:{imgRect.height}px;z-index:200;cursor:{cropCursor};"
+              onpointerdown={onCropDown}
+              onpointermove={onCropMouseMove}
+              onpointerup={onCropUp}
             >
-              <div class="cc tl"></div>
-              <div class="cc tr"></div>
-              <div class="cc bl"></div>
-              <div class="cc br"></div>
+              {#if cropDraft && cropDraft.w > 0.5 && cropDraft.h > 0.5}
+                <!-- Dark shade outside crop -->
+                <div class="crop-shade"></div>
+                <!-- Crop rectangle -->
+                <div
+                  class="crop-rect"
+                  style="left:{cropDraft.x}%;top:{cropDraft.y}%;width:{cropDraft.w}%;height:{cropDraft.h}%"
+                >
+                  <!-- Rule of thirds -->
+                  <div class="rof h1"></div>
+                  <div class="rof h2"></div>
+                  <div class="rof v1"></div>
+                  <div class="rof v2"></div>
+                  <!-- 8 resize handles -->
+                  <div class="ch ch-tl" style="cursor:nwse-resize"></div>
+                  <div class="ch ch-t" style="cursor:ns-resize"></div>
+                  <div class="ch ch-tr" style="cursor:nesw-resize"></div>
+                  <div class="ch ch-r" style="cursor:ew-resize"></div>
+                  <div class="ch ch-br" style="cursor:nwse-resize"></div>
+                  <div class="ch ch-b" style="cursor:ns-resize"></div>
+                  <div class="ch ch-bl" style="cursor:nesw-resize"></div>
+                  <div class="ch ch-l" style="cursor:ew-resize"></div>
+                  <!-- Move cursor interior (above shade, below handles) -->
+                  <div class="crop-interior" style="cursor:move"></div>
+                </div>
+              {/if}
             </div>
           {/if}
         </div>
 
-        <!-- Crop mode floating bar -->
+        <!-- Crop mode floating bar — stopPropagation prevents backdrop close -->
         {#if cropMode}
-          <div class="crop-bar">
-            <span class="crop-hint">Drag to select region</span>
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+          <div class="crop-bar" onclick={(e) => e.stopPropagation()}>
+            <span class="crop-hint">Drag to select · Esc to cancel</span>
             <button
               class="crop-btn apply"
-              onclick={applyCrop}
+              onclick={(e) => {
+                e.stopPropagation();
+                applyCrop();
+              }}
               disabled={!cropDraft || cropDraft.w < 0.5}>Apply</button
             >
-            <button class="crop-btn cancel" onclick={cancelCrop}>Cancel</button>
+            <button
+              class="crop-btn cancel"
+              onclick={(e) => {
+                e.stopPropagation();
+                cancelCrop();
+              }}>Cancel</button
+            >
+          </div>
+        {/if}
+
+        <!-- Active crop indicator + reset -->
+        {#if edit.crop && !cropMode}
+          <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+          <div class="crop-active-bar" onclick={(e) => e.stopPropagation()}>
+            <span class="crop-active-label">
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M6 2v14a2 2 0 0 0 2 2h14" /><path
+                  d="M18 22V8a2 2 0 0 0-2-2H2"
+                />
+              </svg>
+              Cropped {edit.crop.w.toFixed(0)}×{edit.crop.h.toFixed(0)}%
+            </span>
+            <button
+              class="crop-reset-btn"
+              onclick={(e) => {
+                e.stopPropagation();
+                resetCrop();
+              }}>✕ Reset crop</button
+            >
           </div>
         {/if}
 
@@ -870,7 +1342,8 @@
 
     <!-- ── Sidebar ── -->
     {#if sidebarOpen}
-      <aside class="tool-panel">
+      <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
+      <aside class="tool-panel" onclick={(e) => e.stopPropagation()}>
         <div class="tp-header">
           <span class="tp-title">Tools</span>
           <span class="tp-keys"
@@ -958,18 +1431,21 @@
                     d="M18 22V8a2 2 0 0 0-2-2H2"
                   />
                 </svg>
-                {cropMode ? 'Drawing crop…' : 'Draw crop'}
+                {cropMode
+                  ? 'Drawing crop…'
+                  : edit.crop
+                    ? 'Redraw crop'
+                    : 'Draw crop'}
               </button>
               {#if edit.crop}
-                <button class="tb tb-danger" onclick={resetCrop}>✕ Reset</button
+                <button class="tb tb-danger" onclick={() => resetCrop()}
+                  >✕ Reset</button
                 >
               {/if}
             </div>
             {#if edit.crop}
               <div class="tp-chip">
-                {edit.crop.x.toFixed(0)},{edit.crop.y.toFixed(0)} · {edit.crop.w.toFixed(
-                  0,
-                )}×{edit.crop.h.toFixed(0)}%
+                Active · {edit.crop.w.toFixed(0)}×{edit.crop.h.toFixed(0)}%
               </div>
             {/if}
           </div>
@@ -977,7 +1453,7 @@
           <!-- Adjustments -->
           <div class="tp-section">
             <div class="tp-section-label">Adjustments</div>
-            {#each [{ key: 'brightness', label: 'Brightness', min: 0, max: 200, def: 100 }, { key: 'contrast', label: 'Contrast', min: 0, max: 200, def: 100 }, { key: 'saturation', label: 'Saturation', min: 0, max: 200, def: 100 }, { key: 'hue', label: 'Hue', min: 0, max: 360, def: 0 }, { key: 'vignette', label: 'Vignette', min: 0, max: 100, def: 0 }] as adj}
+            {#each [{ key: 'brightness', label: 'Brightness', min: 0, max: 200, def: 100 }, { key: 'contrast', label: 'Contrast', min: 0, max: 200, def: 100 }, { key: 'saturation', label: 'Saturation', min: 0, max: 200, def: 100 }, { key: 'hue', label: 'Hue', min: 0, max: 360, def: 0 }] as adj}
               <div class="adj-row">
                 <div class="adj-head">
                   <span class="adj-label">{adj.label}</span>
@@ -1035,8 +1511,9 @@
             <button
               class="tf-btn tf-danger"
               onclick={() => {
-                clearEdit(editorImage!.src);
+                clearEdit(editorImage!.src, editorImage!.id);
                 edit = { ...DEFAULT_EDIT };
+                editBaseline = { ...DEFAULT_EDIT };
               }}>Discard saved</button
             >
           {/if}
@@ -1649,11 +2126,8 @@
   }
   .editor-img {
     display: block;
-    /* Both axes clamped to the smaller of stage width/height.
-     When rotated 90/270°, CSS width becomes visual height — so by limiting
-     to min(cqw,cqh) on BOTH axes the image always fits the stage. */
-    max-width: min(100cqw, 100cqh);
-    max-height: min(100cqh, 100cqw);
+    max-width: 100cqw;
+    max-height: 100cqh;
     width: auto;
     height: auto;
     object-fit: contain;
@@ -1663,67 +2137,159 @@
       transform 0.25s ease;
     transform-origin: center center;
   }
-  .vignette-overlay {
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    border-radius: 2px;
-    background: radial-gradient(
-      ellipse at center,
-      rgba(0, 0, 0, 0) 25%,
-      rgba(0, 0, 0, calc(var(--va, 0) * 1)) 100%
-    );
+  .editor-img.rotated {
+    max-width: 100cqh;
+    max-height: 100cqw;
   }
-  .crop-mask {
+  /* Preview canvas result — no rotation needed, already baked in */
+  .editor-img.preview-img {
+    max-width: 100cqw;
+    max-height: 100cqh;
+    transform: none !important;
+    filter: none !important;
+  }
+
+  /* Dark semi-transparent overlay outside the draft crop rect */
+  .crop-shade {
     position: absolute;
     inset: 0;
-    pointer-events: none;
-    box-shadow:
-      0 0 0 9999px rgba(0, 0, 0, 0.55),
-      inset calc(var(--cx)) calc(var(--cy)) 0 0 rgba(0, 0, 0, 0);
-    /* Use clip-path to show only the crop region */
-    clip-path: polygon(
-      0% 0%,
-      0% 100%,
-      var(--cx) 100%,
-      var(--cx) var(--cy),
-      calc(var(--cx) + var(--cw)) var(--cy),
-      calc(var(--cx) + var(--cw)) calc(var(--cy) + var(--ch)),
-      var(--cx) calc(var(--cy) + var(--ch)),
-      var(--cx) 100%,
-      100% 100%,
-      100% 0%
-    );
     background: rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+    z-index: 1;
   }
+  /* The crop-rect sits above the shade, punching through it visually */
   .crop-rect {
     position: absolute;
-    border: 1.5px solid #fff;
-    background: rgba(255, 255, 255, 0.06);
+    border: 1.5px solid rgba(255, 255, 255, 0.9);
+    background: transparent;
     pointer-events: none;
+    box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+    z-index: 2;
   }
   .cc {
     position: absolute;
-    width: 8px;
-    height: 8px;
-    background: #fff;
-    border-radius: 1px;
+    width: 10px;
+    height: 10px;
+    border-color: #fff;
+    border-style: solid;
   }
   .cc.tl {
-    top: -2px;
-    left: -2px;
+    top: -1px;
+    left: -1px;
+    border-width: 2px 0 0 2px;
   }
   .cc.tr {
-    top: -2px;
-    right: -2px;
+    top: -1px;
+    right: -1px;
+    border-width: 2px 2px 0 0;
   }
   .cc.bl {
-    bottom: -2px;
-    left: -2px;
+    bottom: -1px;
+    left: -1px;
+    border-width: 0 0 2px 2px;
   }
   .cc.br {
-    bottom: -2px;
-    right: -2px;
+    bottom: -1px;
+    right: -1px;
+    border-width: 0 2px 2px 0;
+  }
+
+  /* 8 resize handles */
+  .ch {
+    position: absolute;
+    background: #fff;
+    border: 1.5px solid rgba(0, 0, 0, 0.4);
+    border-radius: 2px;
+    z-index: 3;
+  }
+  /* Corners: 10×10 */
+  .ch-tl,
+  .ch-tr,
+  .ch-bl,
+  .ch-br {
+    width: 10px;
+    height: 10px;
+  }
+  .ch-tl {
+    top: -5px;
+    left: -5px;
+  }
+  .ch-tr {
+    top: -5px;
+    right: -5px;
+  }
+  .ch-bl {
+    bottom: -5px;
+    left: -5px;
+  }
+  .ch-br {
+    bottom: -5px;
+    right: -5px;
+  }
+  /* Edges: 8×24, centered */
+  .ch-t,
+  .ch-b {
+    width: 24px;
+    height: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  .ch-l,
+  .ch-r {
+    width: 8px;
+    height: 24px;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+  .ch-t {
+    top: -4px;
+  }
+  .ch-b {
+    bottom: -4px;
+  }
+  .ch-l {
+    left: -4px;
+  }
+  .ch-r {
+    right: -4px;
+  }
+
+  /* Transparent interior for move — sits inside the rect above the shade */
+  .crop-interior {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+  }
+
+  /* Rule of thirds */
+  .rof {
+    position: absolute;
+    background: rgba(255, 255, 255, 0.2);
+    pointer-events: none;
+  }
+  .rof.h1 {
+    left: 0;
+    right: 0;
+    top: 33.33%;
+    height: 1px;
+  }
+  .rof.h2 {
+    left: 0;
+    right: 0;
+    top: 66.66%;
+    height: 1px;
+  }
+  .rof.v1 {
+    top: 0;
+    bottom: 0;
+    left: 33.33%;
+    width: 1px;
+  }
+  .rof.v2 {
+    top: 0;
+    bottom: 0;
+    left: 66.66%;
+    width: 1px;
   }
 
   .crop-bar {
@@ -1740,6 +2306,7 @@
     padding: 0.45rem 0.875rem;
     backdrop-filter: blur(8px);
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 300;
   }
   .crop-hint {
     font-size: 0.75rem;
@@ -1776,6 +2343,48 @@
   .crop-btn.cancel:hover {
     color: var(--color-text);
     border-color: var(--color-border-hover);
+  }
+
+  /* Active crop indicator bar at bottom of stage */
+  .crop-active-bar {
+    position: absolute;
+    bottom: 1rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 0.35rem 0.75rem;
+    backdrop-filter: blur(8px);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    z-index: 10;
+    pointer-events: auto;
+  }
+  .crop-active-label {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.6875rem;
+    font-family: var(--font-mono);
+    color: var(--color-accent);
+  }
+  .crop-reset-btn {
+    background: none;
+    border: 1px solid color-mix(in srgb, #ef4444 35%, transparent);
+    border-radius: 5px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.6875rem;
+    font-family: var(--font-mono);
+    color: #f87171;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .crop-reset-btn:hover {
+    background: color-mix(in srgb, #ef4444 12%, transparent);
+    border-color: #ef4444;
   }
 
   .stage-chip {
@@ -1956,7 +2565,8 @@
   /* Slider track wrapper for center tick */
   .adj-slider-wrap {
     position: relative;
-    padding: 0.25rem 0;
+    padding: 0.35rem 0;
+    overflow: visible;
   }
   .adj-center-tick {
     position: absolute;
@@ -1968,11 +2578,14 @@
     background: var(--color-border-hover);
     pointer-events: none;
     border-radius: 1px;
-    margin-top: 1px; /* optical center of track */
+    margin-top: 1px;
+    z-index: 0;
   }
   .adj-slider {
     -webkit-appearance: none;
     appearance: none;
+    position: relative;
+    z-index: 1;
     width: 100%;
     height: 5px;
     border-radius: 3px;
@@ -1986,41 +2599,52 @@
         var(--pct, 50%)
     );
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+    /* Critical: allow thumb to visually overflow the track height */
+    overflow: visible;
   }
   .adj-slider:focus {
     outline: none;
   }
   .adj-slider::-webkit-slider-thumb {
     -webkit-appearance: none;
-    width: 16px;
-    height: 16px;
+    position: relative;
+    z-index: 2;
+    width: 18px;
+    height: 18px;
     border-radius: 50%;
-    background: var(--color-text);
+    background: #ffffff;
     border: 2.5px solid var(--color-accent);
     cursor: pointer;
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--color-accent) 30%, transparent);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
     transition:
       box-shadow 0.15s,
       transform 0.1s;
+    /* Ensure thumb renders above track */
+    margin-top: -6.5px;
   }
-  .adj-slider::-webkit-slider-thumb:hover {
-    box-shadow: 0 0 0 5px
-      color-mix(in srgb, var(--color-accent) 20%, transparent);
-    transform: scale(1.1);
+  .adj-slider:hover::-webkit-slider-thumb {
+    box-shadow:
+      0 2px 6px rgba(0, 0, 0, 0.5),
+      0 0 0 5px color-mix(in srgb, var(--color-accent) 22%, transparent);
   }
   .adj-slider:active::-webkit-slider-thumb {
-    box-shadow: 0 0 0 7px
-      color-mix(in srgb, var(--color-accent) 15%, transparent);
-    transform: scale(1.15);
+    transform: scale(1.12);
+    box-shadow:
+      0 2px 6px rgba(0, 0, 0, 0.5),
+      0 0 0 8px color-mix(in srgb, var(--color-accent) 14%, transparent);
+  }
+  .adj-slider::-webkit-slider-runnable-track {
+    height: 5px;
+    border-radius: 3px;
   }
   .adj-slider::-moz-range-thumb {
-    width: 16px;
-    height: 16px;
+    width: 18px;
+    height: 18px;
     border-radius: 50%;
-    background: var(--color-text);
+    background: #ffffff;
     border: 2.5px solid var(--color-accent);
     cursor: pointer;
-    box-shadow: none;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
   }
   .adj-slider::-moz-range-track {
     height: 5px;

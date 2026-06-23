@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"grape/src/common/config"
 	"grape/src/common/dto/request"
+	"grape/src/common/dto/response"
 	"grape/src/common/helper"
 	"grape/src/common/service"
 	"maps"
@@ -19,10 +20,11 @@ import (
 type IndexService struct {
 	config *config.Config
 	links  map[string]string
+	cache  map[string]string
 }
 
 func NewIndexService(s *service.CommonService) *IndexService {
-	return (&IndexService{config: s.Config, links: make(map[string]string)}).fill().sync()
+	return (&IndexService{config: s.Config, links: make(map[string]string), cache: make(map[string]string)}).fill().sync()
 }
 
 func (c *IndexService) compress(file string) string {
@@ -90,7 +92,7 @@ func (c *IndexService) FindAll(dto *request.PageDto) interface{} {
 	return gin.H{"files": dto.Paginate(keys)}
 }
 
-func (c *IndexService) Delete(id string) interface{} {
+func (c *IndexService) DeleteImage(id string) interface{} {
 	if file, ok := c.links[id]; ok {
 		delete(c.links, id)
 
@@ -99,4 +101,20 @@ func (c *IndexService) Delete(id string) interface{} {
 	}
 
 	return gin.H{}
+}
+
+func (c *IndexService) PostImageSettings(id string, body *request.SettingsCreateDto) interface{} {
+	c.cache[id] = body.Settings
+	return gin.H{}
+}
+
+func (c *IndexService) GetImageSettings(id string) (*response.SettingsResponseDto, error) {
+	var res response.SettingsResponseDto
+
+	if settings, ok := c.cache[id]; ok {
+		res.Settings = settings
+		return &res, nil
+	}
+
+	return nil, fmt.Errorf("Settings for %s doesn't exist", id)
 }
