@@ -15,9 +15,6 @@
         vendorHash = pkgs.lib.fakeHash;
       };
 
-    nixosModules.default =
-      import ./nixos/module.nix {
-        inherit self;
-      };
+    nixosModules.default = import ./nixos/module.nix { inherit self; };
   };
 }
