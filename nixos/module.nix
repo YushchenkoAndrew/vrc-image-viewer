@@ -9,6 +9,9 @@ let
     server = { address = cfg.address; prefix = cfg.prefix; };
     vrchat = { src = cfg.src; dst = cfg.dst; };
   };
+  configDir = pkgs.linkFarm "vrc-image-viewer-config" [
+    { name = "config.yaml"; path = configFile; }
+  ];
 in
 {
   options.services.vrc-image-viewer = {
@@ -51,7 +54,7 @@ in
         Group = "users";
 
         # NewConfig expects a directory containing config.yaml.
-        ExecStart = "${server}/bin/vrc-image-viewer --config ${configFile}";
+        ExecStart = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/vrc-image-viewer --config ${configDir}";
         Restart = "on-failure";
         RestartSec = "3s";
 
