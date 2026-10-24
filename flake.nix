@@ -12,7 +12,7 @@
         pname = "vrc-image-viewer";
         version = "master";
         src = self;
-        vendorHash = pkgs.lib.fakeHash;
+        vendorHash = "sha256-eZhPOkhZePbfYWja7gVkME6EBlCSCJMMGOPDPIumHlo=";
       };
 
     nixosModules.default = { ... }: {
