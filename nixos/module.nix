@@ -1,12 +1,11 @@
-{ config, pkgs, lib, ... }:
+{ self, config, pkgs, lib, ... }:
 
 let
   cfg = config.services.vrc-image-viewer;
   server = self.packages.${pkgs.system}.default;
 
   yamlFormat = pkgs.formats.yaml { };
-
-  options = yamlFormat.generate "config.yaml" {
+  configFile = yamlFormat.generate "config.yaml" {
     server = { address = cfg.address; prefix = cfg.prefix; };
     vrchat = { src = cfg.src; dst = cfg.dst; };
   };
@@ -51,12 +50,12 @@ in
         User = "mortis";
         Group = "users";
 
-        ExecStart = "${server}/bin/vrc-image-viewer --config ${options}";
-
+        # NewConfig expects a directory containing config.yaml.
+        ExecStart = "${server}/bin/vrc-image-viewer --config ${configFile}";
         Restart = "on-failure";
         RestartSec = "3s";
 
-        ReadWritePaths = [ cfg.destinationDirectory ];
+        ReadWritePaths = [ cfg.dst ];
 
         NoNewPrivileges = true;
         PrivateTmp = true;
