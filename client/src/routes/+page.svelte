@@ -18,6 +18,9 @@
     contrast: number;
     saturation: number;
     hue: number; // 0–360
+    zoom: number;
+    panning: boolean;
+    pan: { x: number; y: number };
     crop: { x: number; y: number; w: number; h: number } | null;
   }
   const DEFAULT_EDIT: EditState = {
@@ -28,6 +31,9 @@
     contrast: 100,
     saturation: 100,
     hue: 0,
+    zoom: 1,
+    panning: false,
+    pan: { x: 0, y: 0 },
     crop: null,
   };
 
@@ -61,7 +67,7 @@
       const res = await fetch(`/images/${id}/settings`);
       if (!res.ok) return null;
       const json = await res.json();
-      return JSON.parse(json.settings) as EditState;
+      return normalize(JSON.parse(json.settings) as EditState);
     } catch {
       return null;
     }
@@ -69,8 +75,12 @@
 
   let allEdits = $state<Record<string, EditState>>({});
 
+  function normalize(raw: Partial<EditState>): EditState {
+    return { ...JSON.parse(JSON.stringify(DEFAULT_EDIT)), ...raw };
+  }
+
   function getEdit(src: string): EditState {
-    return allEdits[src] ?? { ...DEFAULT_EDIT };
+    return normalize(allEdits[src]);
   }
 
   function setEdit(src: string, id: string, e: EditState) {
@@ -135,6 +145,9 @@
       contrast: edit.contrast,
       saturation: edit.saturation,
       hue: edit.hue,
+      zoom: edit.zoom,
+      panning: false,
+      pan: { x: 0, y: 0 },
       crop: edit.crop ? { ...edit.crop } : null,
     };
     const img = editorImage;
@@ -192,10 +205,11 @@
     ].join(' ');
   }
   function editToTransform(e: EditState): string {
-    const parts = [`rotate(${e.rotation}deg)`];
-    if (e.flipH) parts.push('scaleX(-1)');
-    if (e.flipV) parts.push('scaleY(-1)');
-    return parts.join(' ');
+    return [
+      `translate(${e.pan?.x ?? 0}px, ${e.pan?.y ?? 0}px)`,
+      `rotate(${e.rotation}deg)`,
+      `scale(${e.zoom * (e.flipH ? -1 : 1)}, ${e.zoom * (e.flipV ? -1 : 1)})`,
+    ].join(' ');
   }
 
   // ── Download with canvas ───────────────────────────────────────────────────
@@ -426,27 +440,28 @@
   // ── Editor open/close ──────────────────────────────────────────────────────
   async function openEditor(img: ImageFile) {
     editorImage = img;
-    edit = { ...getEdit(img.src) };
-    editBaseline = null; // clear while loading so effect doesn't fire
+    edit = getEdit(img.src);
+    editBaseline = null;
+
     cropMode = false;
     cropDraft = null;
     cropStart = null;
     editorOpen = true;
     document.body.style.overflow = 'hidden';
 
-    // Fetch remote settings — on success overwrite local
     const remote = await loadRemote(img.id);
-    if (remote) {
-      allEdits = { ...allEdits, [img.src]: remote };
-      saveAllLocal(allEdits);
-      if (editorImage?.src === img.src) {
-        edit = { ...remote };
-      }
-    } else await saveRemote(img.id, allEdits[img.src] || {});
-    // Set baseline AFTER load — effect will only POST if edit diverges from this
-    if (editorImage?.src === img.src) {
-      editBaseline = { ...edit };
-    }
+
+    // Ignore stale responses if another image was opened.
+    if (editorImage?.src !== img.src) return;
+    if (remote) edit = normalize(remote);
+
+    // Persist the complete settings object locally and remotely.
+    allEdits = { ...allEdits, [img.src]: normalize(edit) };
+    saveAllLocal(allEdits);
+    saveRemote(img.id, edit);
+
+    // Set the baseline after loading.
+    editBaseline = normalize(edit);
   }
   function closeEditor() {
     editorOpen = false;
@@ -458,53 +473,50 @@
   }
 
   // ── Transform ──────────────────────────────────────────────────────────────
-  function rotate(deg: number) {
-    edit = { ...edit, rotation: (((edit.rotation + deg) % 360) + 360) % 360 };
+  function rotate(deg: number) { edit = { ...edit, rotation: ((((edit.rotation || 0) + deg) % 360) + 360) % 360 }; } // prettier-ignore
+  function toggleFlipH() { edit = { ...edit, flipH: !edit.flipH }; } // prettier-ignore
+  function toggleFlipV() { edit = { ...edit, flipV: !edit.flipV }; } // prettier-ignore
+
+  let panStart = { x: 0, y: 0 };
+  let pointerStart = { x: 0, y: 0 };
+
+  function onPanUp() { edit.panning = false; } // prettier-ignore
+  function onPanDown(e: PointerEvent) {
+    if (cropMode || edit.crop || e.button !== 0) return;
+
+    e.preventDefault();
+    edit.panning = true;
+
+    pointerStart = { x: e.clientX, y: e.clientY };
+    panStart = { x: edit.pan?.x || 0, y: edit.pan?.y || 0 };
+
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
-  function toggleFlipH() {
-    edit = { ...edit, flipH: !edit.flipH };
-  }
-  function toggleFlipV() {
-    edit = { ...edit, flipV: !edit.flipV };
+
+  function onPanMove(e: PointerEvent) {
+    if (!(e.currentTarget as HTMLElement).hasPointerCapture(e.pointerId)) return; // prettier-ignore
+    edit = { ...edit, pan: { x: panStart.x + (e.clientX - pointerStart.x) * (edit.zoom || 1), y: panStart.y + (e.clientY - pointerStart.y) * (edit.zoom || 1) } }; // prettier-ignore
   }
 
   // ── Crop ───────────────────────────────────────────────────────────────────
   let imgEl: HTMLImageElement;
-  let imgRect = $state<{
-    left: number;
-    top: number;
-    width: number;
-    height: number;
-  } | null>(null);
+  let imgRect = $state<{ left: number; top: number; width: number; height: number; } | null>(null); // prettier-ignore
 
   function updateImgRect() {
-    if (imgEl) {
-      const r = imgEl.getBoundingClientRect();
-      imgRect = { left: r.left, top: r.top, width: r.width, height: r.height };
-    }
+    if (!imgEl) return;
+    const r = imgEl.getBoundingClientRect();
+    imgRect = { left: r.left, top: r.top, width: r.width, height: r.height };
   }
 
-  function enterCropMode() {
-    cropMode = true;
-    cropDraft = null;
-    cropStart = null;
-    requestAnimationFrame(() => requestAnimationFrame(updateImgRect));
-  }
-  function cancelCrop() {
-    cropMode = false;
-    cropDraft = null;
-    cropStart = null;
-    cropAction = 'none';
-  }
+  function enterCropMode() { cropMode = true; cropDraft = cropStart = null; requestAnimationFrame(() => requestAnimationFrame(updateImgRect)); } // prettier-ignore
+  function resetCrop() { edit = { ...edit, crop: null }; } // prettier-ignore
+  function cancelCrop() { cropMode = false; cropDraft = cropStart = null; cropAction = 'none'; } // prettier-ignore
   function applyCrop() {
-    if (cropDraft && cropDraft.w > 0.5 && cropDraft.h > 0.5)
-      edit = { ...edit, crop: { ...cropDraft } };
+    if (cropDraft) edit = { ...edit, crop: { ...cropDraft } }; // prettier-ignore
+
     cropMode = false;
     cropDraft = null;
     cropAction = 'none';
-  }
-  function resetCrop() {
-    edit = { ...edit, crop: null };
   }
 
   function imgPct(cx: number, cy: number) {
@@ -745,83 +757,66 @@
       previewUrl = null;
       return;
     }
+
     const image = new Image();
     image.crossOrigin = 'anonymous';
     image.src = img.src;
-    await new Promise((res, rej) => {
-      image.onload = res;
-      image.onerror = rej;
-    });
+    await image.decode();
 
-    const NW = image.naturalWidth,
-      NH = image.naturalHeight;
-    const rot = ed.rotation;
+    const { naturalWidth: NW, naturalHeight: NH } = image;
+    const rot = (((ed.rotation || 0) % 360) + 360) % 360;
     const swapped = rot === 90 || rot === 270;
-    let cx_n: number, cy_n: number, cw_n: number, ch_n: number;
 
-    const { x: px, y: py, w: pw, h: ph } = ed.crop;
-    let [dx, dy, dw, dh] = [px, py, pw, ph];
-    if (ed.flipH) {
-      dx = 100 - dx - dw;
-    }
-    if (ed.flipV) {
-      dy = 100 - dy - dh;
-    }
+    // Dimensions after rotation
+    const RW = swapped ? NH : NW;
+    const RH = swapped ? NW : NH;
 
-    if (rot === 0) {
-      cx_n = dx;
-      cy_n = dy;
-      cw_n = dw;
-      ch_n = dh;
-    } else if (rot === 90) {
-      cx_n = dy;
-      cy_n = 100 - dx - dw;
-      cw_n = dh;
-      ch_n = dw;
-    } else if (rot === 180) {
-      cx_n = 100 - dx - dw;
-      cy_n = 100 - dy - dh;
-      cw_n = dw;
-      ch_n = dh;
-    } else {
-      cx_n = 100 - dy - dh;
-      cy_n = dx;
-      cw_n = dh;
-      ch_n = dw;
-    }
+    // Crop values are percentages of the rotated image
+    const { x, y, w, h } = ed.crop;
 
-    cx_n = (cx_n / 100) * NW;
-    cy_n = (cy_n / 100) * NH;
-    cw_n = (cw_n / 100) * NW;
-    ch_n = (ch_n / 100) * NH;
-
-    const outW = Math.round(swapped ? ch_n : cw_n);
-    const outH = Math.round(swapped ? cw_n : ch_n);
+    const sx = (x / 100) * RW;
+    const sy = (y / 100) * RH;
+    const sw = (w / 100) * RW;
+    const sh = (h / 100) * RH;
 
     const canvas = document.createElement('canvas');
-    canvas.width = outW;
-    canvas.height = outH;
-    const ctx = canvas.getContext('2d')!;
-    ctx.filter = editToFilter(ed);
-    ctx.save();
-    ctx.translate(outW / 2, outH / 2);
-    ctx.rotate((rot * Math.PI) / 180);
-    if (ed.flipH) ctx.scale(-1, 1);
-    if (ed.flipV) ctx.scale(1, -1);
-    ctx.drawImage(
-      image,
-      cx_n,
-      cy_n,
-      cw_n,
-      ch_n,
-      -cw_n / 2,
-      -ch_n / 2,
-      cw_n,
-      ch_n,
-    );
-    ctx.restore();
+    canvas.width = Math.max(1, Math.round(sw));
+    canvas.height = Math.max(1, Math.round(sh));
 
-    previewUrl = canvas.toDataURL('image/jpeg', 0.92);
+    const ctx = canvas.getContext('2d')!;
+
+    // Map the original image into the rotated coordinate system.
+    ctx.translate(RW / 2, RH / 2);
+    ctx.rotate((rot * Math.PI) / 180);
+    ctx.scale(ed.flipH ? -1 : 1, ed.flipV ? -1 : 1);
+
+    // Draw the full image centered around the origin.
+    ctx.drawImage(image, -NW / 2, -NH / 2);
+
+    // Crop using a second canvas because the first canvas is the output.
+    const rotatedCanvas = document.createElement('canvas');
+    rotatedCanvas.width = RW;
+    rotatedCanvas.height = RH;
+
+    const rctx = rotatedCanvas.getContext('2d')!;
+    rctx.translate(RW / 2, RH / 2);
+    rctx.rotate((rot * Math.PI) / 180);
+    rctx.scale(ed.flipH ? -1 : 1, ed.flipV ? -1 : 1);
+    rctx.drawImage(image, -NW / 2, -NH / 2);
+
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = Math.max(1, Math.round(sw));
+    cropCanvas.height = Math.max(1, Math.round(sh));
+
+    cropCanvas
+      .getContext('2d')!
+      .drawImage(
+        rotatedCanvas,
+        sx, sy, sw, sh,
+        0, 0, cropCanvas.width, cropCanvas.height,
+      ); // prettier-ignore
+
+    previewUrl = cropCanvas.toDataURL('image/jpeg', 0.92);
   }
 
   // Re-render preview whenever edit changes and crop is set
@@ -910,8 +905,7 @@
       oninput={handleInput}
       rows={5}
       placeholder="Type your query… auto-synced after 500ms"
-      class="query-textarea"
-    ></textarea>
+      class="query-textarea"></textarea>
     <div class="textarea-footer">
       <span class="char-count">{charCount} chars</span>
       {#if charCount > 0}
@@ -1219,13 +1213,29 @@
       <!-- Image stage -->
       <div class="canvas-stage">
         <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_interactions -->
-        <div class="crop-zone" onclick={(e) => e.stopPropagation()}>
+        <div
+          class="crop-zone"
+          class:can-pan={!cropMode && !edit.crop}
+          onpointerdown={onPanDown}
+          onpointermove={onPanMove}
+          onpointerup={onPanUp}
+          onclick={(e) => {
+            if (!imgEl) return;
+
+            const rect = imgEl.getBoundingClientRect();
+            const { clientX: x, clientY: y } = e;
+
+            if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) closeEditor();
+            else e.stopPropagation(); // prettier-ignore
+          }}
+        >
           {#if previewUrl && !cropMode}
             <!-- Canvas-rendered crop preview: exact same output as download -->
             <img
               src={previewUrl}
               alt="Crop preview"
               class="editor-img preview-img"
+              style="transform:scale({edit.zoom}, {edit.zoom}) !important;"
             />
           {:else}
             <!-- Live image with CSS rotation/flip/filter -->
@@ -1234,6 +1244,7 @@
               src={editorImage.src}
               alt={editorImage.name}
               class="editor-img"
+              class:panning={edit.panning}
               class:rotated={edit.rotation === 90 || edit.rotation === 270}
               style="filter:{editorFilter};transform:{editorTransform};"
             />
@@ -1249,7 +1260,7 @@
               onpointermove={onCropMouseMove}
               onpointerup={onCropUp}
             >
-              {#if cropDraft && cropDraft.w > 0.5 && cropDraft.h > 0.5}
+              {#if cropDraft}
                 <!-- Dark shade outside crop -->
                 <div class="crop-shade"></div>
                 <!-- Crop rectangle -->
@@ -1453,7 +1464,7 @@
           <!-- Adjustments -->
           <div class="tp-section">
             <div class="tp-section-label">Adjustments</div>
-            {#each [{ key: 'brightness', label: 'Brightness', min: 0, max: 200, def: 100 }, { key: 'contrast', label: 'Contrast', min: 0, max: 200, def: 100 }, { key: 'saturation', label: 'Saturation', min: 0, max: 200, def: 100 }, { key: 'hue', label: 'Hue', min: 0, max: 360, def: 0 }] as adj}
+            {#each [{ key: 'brightness', label: 'Brightness', min: 0, max: 200, def: 100 }, { key: 'contrast', label: 'Contrast', min: 0, max: 200, def: 100 }, { key: 'saturation', label: 'Saturation', min: 0, max: 200, def: 100 }, { key: 'hue', label: 'Hue', min: 0, max: 360, def: 0 }, { key: 'zoom', label: 'Zoom', min: 0.25, max: 5, def: 1, step: '0.05' }] as adj}
               <div class="adj-row">
                 <div class="adj-head">
                   <span class="adj-label">{adj.label}</span>
@@ -1475,7 +1486,7 @@
                     type="range"
                     min={adj.min}
                     max={adj.max}
-                    step="1"
+                    step={adj.step || 1}
                     value={edit[adj.key as keyof EditState] as number}
                     style="--pct:{(((edit[
                       adj.key as keyof EditState
@@ -2119,10 +2130,14 @@
     container-type: size;
   }
   .crop-zone {
+    touch-action: none;
     position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+  }
+  .crop-zone.can-pan {
+    cursor: grab;
   }
   .editor-img {
     display: block;
@@ -2136,6 +2151,9 @@
       filter 0.2s ease,
       transform 0.25s ease;
     transform-origin: center center;
+  }
+  .editor-img.panning {
+    transition: none;
   }
   .editor-img.rotated {
     max-width: 100cqh;

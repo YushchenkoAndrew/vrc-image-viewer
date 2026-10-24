@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"grape/src"
 	"grape/src/common/config"
 	"grape/src/common/dto/response"
@@ -29,8 +30,10 @@ import (
 
 // @BasePath /grape
 func main() {
-	cfg := config.NewConfig("configs/", "config", "yaml")
+	dir := flag.String("config", "configs/", "Path to config directory")
+	flag.Parse()
 
+	cfg := config.NewConfig(*dir, "config", "yaml")
 	service := &service.CommonService{
 		Config: cfg,
 	}
