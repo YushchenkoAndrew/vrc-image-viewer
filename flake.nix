@@ -13,6 +13,9 @@
         version = "master";
         src = self;
         vendorHash = "sha256-eZhPOkhZePbfYWja7gVkME6EBlCSCJMMGOPDPIumHlo=";
+        postInstall = ''
+          mv $out/bin/grape $out/bin/vrc-image-viewer
+        '';
       };
 
     nixosModules.default = { ... }: {
