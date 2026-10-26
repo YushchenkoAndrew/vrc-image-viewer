@@ -476,6 +476,13 @@
   function rotate(deg: number) { edit = { ...edit, rotation: ((((edit.rotation || 0) + deg) % 360) + 360) % 360 }; } // prettier-ignore
   function toggleFlipH() { edit = { ...edit, flipH: !edit.flipH }; } // prettier-ignore
   function toggleFlipV() { edit = { ...edit, flipV: !edit.flipV }; } // prettier-ignore
+  function onZoom(event: WheelEvent) {
+    event.preventDefault();
+    const STEP = 1.03;
+
+    const zoomFactor = event.deltaY > 0 ? STEP : 1 / STEP;
+    edit = { ...edit, zoom: Math.min(5, Math.max(0.25, Number((edit.zoom * zoomFactor).toFixed(2)))) }; // prettier-ignore
+  }
 
   let panStart = { x: 0, y: 0 };
   let pointerStart = { x: 0, y: 0 };
@@ -1219,6 +1226,7 @@
           onpointerdown={onPanDown}
           onpointermove={onPanMove}
           onpointerup={onPanUp}
+          onwheel={onZoom}
           onclick={(e) => {
             if (!imgEl) return;
 
